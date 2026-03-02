@@ -6,34 +6,175 @@ date: "2026-02-28"
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(fpp3)
 ```
 
-## Data Loading
+# 1. Data Loading
 
 ```{r initial_analysis, echo=TRUE}
+# Read in data
 data <- read.csv("IMPCH.csv")
 impch <- data$IMPCH
 
+# Create ts object (yearly)
 impch_ts <- ts(impch, start=c(1985,1), frequency=12)
-plot(impch_ts)
+
+# Check for missing values
+sum(is.na(impch_ts)) # result here is 0
+
 ```
 
-## Preprocessing
+# 2. Preprocessing
 We can do some analysis here on trend / seasonality/ whatever. We can also split our training data now.
 ```{r pressure, echo=TRUE}
 # TODO: normalize dataset, will need to in all likelihood. Run tests for all those things
+
+# Observe raw series
+autoplot(impch_ts) + ggtitle("IMPCH (level)")
 ```
+The plot shows clear strong upward trend and increasing variability (variance grows as values get larger), therefore will need a Box-Cox transformation.
+
+```{r pressure, echo=TRUE}
+# Find optimal lambda
+lambda <- BoxCox.lambda(impch_ts) 
+impch_bc <- BoxCox(impch_ts, lambda)
+
+autoplot(impch_bc) + ggtitle("log(IMPCH (level))")
+```
+With lambda = 0.102, variance has stabilized significantly, with less wild swings at the end of the timeframe.
+
+```{r pressure, echo=TRUE}
+# Train & test split for time series
+train <- window(impch_bc, end = c(2020, 12))
+test <- window(impch_bc, start = c(2021, 1))
+
+# Verify split
+cat("TRAIN: Jan 1985 to Dec 2020 (", length(train), "obs)\n")
+cat("TEST:  Jan 2021 to Dec 2025 (", length(test),  "obs)\n")
+cat("Train %: ", round(100 * length(train) / length(impch_ts), 1), "%\n")
+```
+We used a defined train/test split (vs. the conventional 80/20) to incorporate COVID-19 effects while maintaining a meaningful out-of-sample test period, for two reasons:
+
+1. COVID-aware training: Includes 2020 to capture the pandemic onset and initial economic shock, allowing whatever model we use to learn from this structural break.
+
+2. Realistic forecasting validation: The 2021-2025 test period covers post-COVID recovery and stabilization, and provides a realistic test of forecast performance under the 'new normal' conditions.
 
 
-## Model Fitting
-Do our ARIMA / EPS / VAR / all the model fitting here
+# Model Fitting
 ```{r model_fit, echo=TRUE}
 # Fit at least three different types of models for evaluation. We can choose one of the sliding windows to use here as well
 ```
 
+### Model #1: ARIMA
+```{r model_fit, echo=TRUE}
+# Non-seasoning differencing
+diff1 <- diff(train)
+diff2 <- diff(train, 2)
 
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
 
-## Model Forecasting
-Do the extra stuff here
-```{r forecast, echo=TRUE}
+Acf(diff1, main = "ACF of 1st difference")
+Pacf(diff1, main = "PACF of 1st difference")
+Acf(diff2, main = "ACF of 2nd difference")
+Pacf(diff2, main = "PACF of 2nd difference")
+
+par(mfrow = c(1, 1))
 ```
+ACF/PACF of 1st difference shows lags mostly within the bands, expect a few seasonal spikes. ACF/PACF of 2nd difference looks much noisier, with larger spikes, indicating potentially over-differencing.
+
+```{r model_fit, echo=TRUE}
+# Seasonal differencing
+diff_seasonal <- diff(train, lag = 12)
+diff_both <- diff(diff(train), lag = 12)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+Acf(diff_seasonal, main = "ACF of D = 1", lag.max = 36)
+Pacf(diff_seasonal, main = "PACF of D = 1", lag.max = 36)
+Acf(diff_both, main = "ACF of d = 1, D = 1", lag.max = 36)
+Pacf(diff_both, main = "PACF of d = 1, D = 1", lag.max = 36)
+```
+ACF after seasonal differencing only (D = 1) shows a slow decay across lags, indicating that the series is still non-stationary and seaosnal differencing alone is not enough.
+
+ACF after both differencing (d = 1, D = 1), shows autocorrelations that are now mostly small and within the blue bounds, except maybe one seaosnal spike around lag 12.
+
+Two potential SARIMA candidates to investigate are:
+1. (1,1,0)(0,1,1) - one noticeable spike at lag 1 for PACF (likely AR(1)), one noticeable spike at lag 1 for ACF (likely MA(1))
+2. (0,1,1)(0,1,1) - ACF spike at lag 12 (likely MA(1))
+
+```{r model_fit, echo=TRUE}
+# Model 1: ARIMA(1,1,0)(0,1,1)
+arima_fit1 <- Arima(train,
+              order = c(1,1,0),
+              seasonal = list(order = c(0,1,1), period = 12))
+
+# Model 2: ARIMA(0,1,1)(0,1,1)
+arima_fit2 <- Arima(train,
+              order   = c(0,1,1),
+              seasonal = list(order = c(0,1,1), period = 12))
+
+# Model 3: Using auto.arima to choose best model
+arima_fit3 <- auto.arima(train, 
+                   seasonal = TRUE,
+                   stepwise = FALSE,
+                   approximation = FALSE)
+
+model_compare <- data.frame(
+  Model = c("ARIMA(1,1,0)(0,1,1)",
+            "ARIMA(0,1,1)(0,1,1)",
+            "auto.arima"),
+  AICc = round(c(arima_fit1$aicc, arima_fit2$aicc, arima_fit3$aicc), 2),
+  BIC = round(c(BIC(arima_fit1),  BIC(arima_fit2),  BIC(arima_fit3)),  2)
+)
+model_compare
+print (arima_fit3)
+```
+The auto.arima model ARIMA(2,1,1)(2,1,0) has lower AICc and BIC, indicating the model that provides the best balance between fitting the data well and keeping the model simple / avoiding overfitting.
+
+# Model Forecasting
+Do the extra stuff here
+
+### Model #1: ARIMA
+```{r forecast, echo=TRUE}
+best_arima <- arima_fit3
+
+h <- length(test)
+fc_arima <- forecast(best_arima, h = h)
+
+fc_impch_arima <- fc_arima
+fc_impch_arima$mean <- InvBoxCox(fc_arima$mean,  lambda)
+fc_impch_arima$lower <- InvBoxCox(fc_arima$lower, lambda)
+fc_impch_arima$upper <- InvBoxCox(fc_arima$upper, lambda)
+fc_impch_arima$x <- impch_ts
+
+autoplot(fc_impch_arima) +
+  ggtitle("IMPCH: ARIMA forecasts for next periods") +
+  ylab("IMPCH") +
+  xlab("Time")
+```
+Based on below residuals for best_arima, it looks like although residuals are normally distributed and resemble white noise with mean zero, our ACF still shows significant lags (7 and 11)
+```{r forecast, echo=TRUE}
+checkresiduals(best_arima)
+
+fc_all <- forecast(best_arima, h = h)
+fc_all_bc <- fc_all
+fc_all_bc$mean <- InvBoxCox(fc_all$mean, lambda)
+
+fc_ts <- ts(InvBoxCox(fc_all$mean, lambda),
+            start     = start(test),
+            frequency = frequency(test))
+
+autoplot(impch_ts) +
+  autolayer(fc_ts, series = "ARIMA forecast") +
+  ggtitle("IMPCH: auto.arima forecast vs full series") +
+  labs(x = "Time", y = "IMPCH")
+```
+
+## Model 2
+We've done a standard SARIMA model, and found that the best we can produce is (2,1,1)(2,1,0). Now, we can try other models and see their respective performances as well
+
+```{r model_expand_slide}
