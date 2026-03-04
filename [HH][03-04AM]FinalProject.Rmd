@@ -1,0 +1,434 @@
+---
+title: "FinalProject"
+output: html_document
+date: "2026-02-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(TSA)
+library(lmtest)
+library(gridExtra)
+```
+
+# Introduction
+
+## Problem Statement
+
+U.S. imports of goods from China represent one of the most economically significant bilateral trade flows in the world. Over the past four decades, this trade relationship has been shaped by China's accession to the WTO (2001), escalating tariffs during the U.S.–China trade war (2018–2019), and severe supply-chain disruptions during the COVID-19 pandemic (2020). Understanding and forecasting this series is valuable for trade policy analysis, supply-chain planning, and macroeconomic research.
+
+## Objective
+
+The objective of this project is to model and forecast monthly U.S. imports of goods from China (measured in millions of dollars) using techniques from three distinct model categories covered in ADSP 31006:
+
+1. **SARIMA** (Seasonal ARIMA via Box-Jenkins methodology)
+2. **ETS** (Exponential Smoothing / Holt-Winters)
+3. **Dynamic Harmonic Regression** (Fourier terms with ARIMA errors)
+
+We compare the forecasting performance of these three approaches on a held-out test set (Jan 2021 – Dec 2025) and select the best model based on standard accuracy metrics.
+
+## Data Source and Description
+
+The dataset is sourced from the Federal Reserve Economic Data (FRED) database:
+
+- **Series**: U.S. Imports of Goods by Customs Basis from China (`IMPCH`)
+- **URL**: <https://fred.stlouisfed.org/series/IMPCH>
+- **Frequency**: Monthly
+- **Units**: Millions of U.S. Dollars, Not Seasonally Adjusted
+- **Period**: January 1985 – December 2025
+
+# 1. Data Loading
+
+```{r initial_analysis, echo=TRUE}
+# Read in data
+data <- read.csv("IMPCH.csv")
+impch <- data$IMPCH
+
+# Create ts object (yearly)
+impch_ts <- ts(impch, start=c(1985,1), frequency=12)
+
+# Check for missing values
+sum(is.na(impch_ts)) # result here is 0
+
+```
+
+
+
+
+# 2. Preprocessing
+We can do some analysis here on trend / seasonality/ whatever. We can also split our training data now.
+```{r pressure, echo=TRUE}
+# TODO: normalize dataset, will need to in all likelihood. Run tests for all those things
+
+# Observe raw series
+autoplot(impch_ts) +
+  ggtitle("U.S. Imports of Goods from China (1985–2025)") +
+  ylab("Millions of USD") + xlab("Year") +
+  theme_minimal()
+```
+**Observations:**
+
+- A strong upward **trend** from ~\$300M/month in 1985 to peaks exceeding \$50B/month by 2022.
+- Clear **seasonality**: imports typically peak around October–November (ahead of the holiday season) and dip in February (Lunar New Year factory shutdowns).
+- The **variance increases** with the level of the series — a hallmark of multiplicative behavior requiring stabilization.
+- Visible **structural breaks**: the 2008–2009 financial crisis, 2018–2019 trade war tariffs, and the sharp 2020 COVID-19 drop.
+
+### Seasonal Plots
+
+```{r eda_seasonal, fig.height=5}
+ggseasonplot(impch_ts, year.labels = FALSE, col = rainbow(40)) +
+  ggtitle("Seasonal Plot: U.S. Imports from China") +
+  ylab("Millions of USD") + theme_minimal()
+```
+
+```{r eda_subseries, fig.height=5}
+ggsubseriesplot(impch_ts) +
+  ggtitle("Seasonal Subseries Plot") +
+  ylab("Millions of USD") + theme_minimal()
+```
+
+The seasonal subseries plot confirms a consistent annual pattern: imports ramp up from March through October, peak around September–October, then decline sharply in November–February.
+
+## Data Preparation
+
+### Box-Cox Transformation
+
+Because the variance grows proportionally with the level of the series, we apply a Box-Cox transformation to stabilize the variance before modeling.
+
+```{r pressure, echo=TRUE}
+# Find optimal lambda
+lambda <- BoxCox.lambda(impch_ts) 
+impch_bc <- BoxCox(impch_ts, lambda)
+
+p1 <- autoplot(impch_ts) + ggtitle("Original Series") +
+  ylab("Millions of USD") + theme_minimal()
+p2 <- autoplot(impch_bc) +
+  ggtitle(paste0("Box-Cox Transformed (lambda = ", round(lambda, 3), ")")) +
+  ylab("Transformed") + theme_minimal()
+
+grid.arrange(p1, p2, ncol = 1)
+```
+With lambda = 0.102, variance has stabilized significantly, with less wild swings at the end of the timeframe.
+
+### Train–Test Split
+
+```{r pressure, echo=TRUE}
+# Train & test split for time series
+train <- window(impch_bc, end = c(2020, 12))
+test <- window(impch_bc, start = c(2021, 1))
+
+# Verify split
+cat("TRAIN: Jan 1985 to Dec 2020 (", length(train), "obs)\n")
+cat("TEST:  Jan 2021 to Dec 2025 (", length(test),  "obs)\n")
+cat("Train %: ", round(100 * length(train) / length(impch_ts), 1), "%\n")
+```
+We used a defined train/test split (vs. the conventional 80/20) to incorporate COVID-19 effects while maintaining a meaningful out-of-sample test period, for two reasons:
+
+1. COVID-aware training: Includes 2020 to capture the pandemic onset and initial economic shock, allowing whatever model we use to learn from this structural break.
+
+2. Realistic forecasting validation: The 2021-2025 test period covers post-COVID recovery and stabilization, and provides a realistic test of forecast performance under the 'new normal' conditions.
+
+# Experimental Results and Analysis
+
+## Stationarity Analysis
+
+### Unit Root Tests on the Original (Box-Cox) Series
+
+```{r stationarity_tests}
+cat("=== ADF Test (H0: non-stationary) ===\n")
+adf.test(train)
+
+cat("\n=== KPSS Test (H0: stationary) ===\n")
+kpss.test(train)
+```
+
+As expected, the series is non-stationary. We apply differencing to achieve stationarity.
+
+### Differencing
+
+```{r differencing, fig.height=8}
+# First difference (d = 1)
+diff1 <- diff(train)
+
+# Seasonal difference (D = 1)
+diff_seasonal <- diff(train, lag = 12)
+
+# Both differences (d = 1, D = 1)
+diff_both <- diff(diff(train), lag = 12)
+
+par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+plot(diff1, main = "First Difference (d = 1)", ylab = "")
+plot(diff_seasonal, main = "Seasonal Difference (D = 1)", ylab = "")
+plot(diff_both, main = "First + Seasonal Difference (d = 1, D = 1)", ylab = "")
+par(mfrow = c(1, 1))
+```
+
+```{r diff_tests}
+cat("=== ADF test on d=1, D=1 differenced series ===\n")
+adf.test(diff_both)
+
+cat("\n=== KPSS test on d=1, D=1 differenced series ===\n")
+kpss.test(diff_both)
+```
+
+After applying both a first and seasonal difference, the series is stationary (ADF rejects the null of non-stationarity; KPSS fails to reject the null of stationarity).
+
+### ACF and PACF of the Differenced Series
+
+```{r acf_pacf_diff, fig.height=6}
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+Acf(diff1,     lag.max = 36, main = "ACF: d = 1")
+Pacf(diff1,    lag.max = 36, main = "PACF: d = 1")
+Acf(diff_both, lag.max = 36, main = "ACF: d = 1, D = 1")
+Pacf(diff_both, lag.max = 36, main = "PACF: d = 1, D = 1")
+par(mfrow = c(1, 1))
+```
+
+**Interpretation of ACF/PACF for d = 1, D = 1:**
+
+- **Non-seasonal:** ACF shows a significant spike at lag 1 that cuts off; PACF shows a spike at lag 1–2 with possible decay. This suggests MA(1) or ARMA(1,1) or ARMA(2,1) for the non-seasonal part.
+- **Seasonal (lags 12, 24, 36):** ACF shows a significant negative spike at lag 12 that cuts off; PACF shows decay at seasonal lags. This suggests SMA(1) for the seasonal part.
+
+### Spectral Analysis
+
+```{r spectral, fig.height=5}
+spec_result <- periodogram(diff1, main = "Periodogram of First-Differenced Series")
+
+# Identify dominant frequencies
+spec_df <- data.frame(freq = spec_result$freq, spec = spec_result$spec)
+spec_sorted <- spec_df[order(-spec_df$spec), ]
+cat("\nTop 5 dominant frequencies:\n")
+print(head(spec_sorted, 5))
+cat("\nCorresponding periods (months):\n")
+cat(round(1 / head(spec_sorted$freq, 5), 1), "\n")
+```
+
+```{r spectral_density, fig.height=5}
+spectrum(as.numeric(diff1), spans = c(5, 5),
+         main = "Smoothed Spectral Density (d = 1)")
+```
+
+The spectral analysis confirms dominant periodicities at approximately 12 months (annual cycle) and 6 months (semi-annual), consistent with the seasonal import patterns observed in the time plots.
+
+# Model Fitting
+```{r model_fit, echo=TRUE}
+# Fit at least three different types of models for evaluation. We can choose one of the sliding windows to use here as well
+```
+
+### Model #1: ARIMA
+```{r model_fit, echo=TRUE}
+# Non-seasoning differencing
+diff1 <- diff(train)
+diff2 <- diff(train, 2)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+Acf(diff1, main = "ACF of 1st difference")
+Pacf(diff1, main = "PACF of 1st difference")
+Acf(diff2, main = "ACF of 2nd difference")
+Pacf(diff2, main = "PACF of 2nd difference")
+
+par(mfrow = c(1, 1))
+```
+ACF/PACF of 1st difference shows lags mostly within the bands, expect a few seasonal spikes. ACF/PACF of 2nd difference looks much noisier, with larger spikes, indicating potentially over-differencing.
+
+```{r model_fit, echo=TRUE}
+# Seasonal differencing
+diff_seasonal <- diff(train, lag = 12)
+diff_both <- diff(diff(train), lag = 12)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+Acf(diff_seasonal, main = "ACF of D = 1", lag.max = 36)
+Pacf(diff_seasonal, main = "PACF of D = 1", lag.max = 36)
+Acf(diff_both, main = "ACF of d = 1, D = 1", lag.max = 36)
+Pacf(diff_both, main = "PACF of d = 1, D = 1", lag.max = 36)
+```
+ACF after seasonal differencing only (D = 1) shows a slow decay across lags, indicating that the series is still non-stationary and seaosnal differencing alone is not enough.
+
+ACF after both differencing (d = 1, D = 1), shows autocorrelations that are now mostly small and within the blue bounds, except maybe one seaosnal spike around lag 12.
+
+Two potential SARIMA candidates to investigate are:
+1. (1,1,0)(0,1,1) - one noticeable spike at lag 1 for PACF (likely AR(1)), one noticeable spike at lag 1 for ACF (likely MA(1))
+2. (0,1,1)(0,1,1) - ACF spike at lag 12 (likely MA(1))
+
+```{r model_fit, echo=TRUE}
+# Model 1: ARIMA(1,1,0)(0,1,1)
+arima_fit1 <- Arima(train,
+              order = c(1,1,0),
+              seasonal = list(order = c(0,1,1), period = 12))
+
+# Model 2: ARIMA(0,1,1)(0,1,1)
+arima_fit2 <- Arima(train,
+              order   = c(0,1,1),
+              seasonal = list(order = c(0,1,1), period = 12))
+
+# Model 3: Using auto.arima to choose best model
+arima_fit3 <- auto.arima(train, 
+                   seasonal = TRUE,
+                   stepwise = FALSE,
+                   approximation = FALSE)
+
+model_compare <- data.frame(
+  Model = c("ARIMA(1,1,0)(0,1,1)",
+            "ARIMA(0,1,1)(0,1,1)",
+            "auto.arima"),
+  AICc = round(c(arima_fit1$aicc, arima_fit2$aicc, arima_fit3$aicc), 2),
+  BIC = round(c(BIC(arima_fit1),  BIC(arima_fit2),  BIC(arima_fit3)),  2)
+)
+model_compare
+print (arima_fit3)
+```
+The auto.arima model ARIMA(2,1,1)(2,1,0) has lower AICc and BIC, indicating the model that provides the best balance between fitting the data well and keeping the model simple / avoiding overfitting.
+
+# Model Forecasting
+Do the extra stuff here
+
+### Model #1: ARIMA
+```{r forecast, echo=TRUE}
+best_arima <- arima_fit3
+
+h <- length(test)
+fc_arima <- forecast(best_arima, h = h)
+
+fc_impch_arima <- fc_arima
+fc_impch_arima$mean <- InvBoxCox(fc_arima$mean,  lambda)
+fc_impch_arima$lower <- InvBoxCox(fc_arima$lower, lambda)
+fc_impch_arima$upper <- InvBoxCox(fc_arima$upper, lambda)
+fc_impch_arima$x <- impch_ts
+
+autoplot(fc_impch_arima) +
+  ggtitle("IMPCH: ARIMA forecasts for next periods") +
+  ylab("IMPCH") +
+  xlab("Time")
+```
+Based on below residuals for best_arima, it looks like although residuals are normally distributed and resemble white noise with mean zero, our ACF still shows significant lags (7 and 11)
+```{r forecast, echo=TRUE}
+checkresiduals(best_arima)
+
+fc_all <- forecast(best_arima, h = h)
+fc_all_bc <- fc_all
+fc_all_bc$mean <- InvBoxCox(fc_all$mean, lambda)
+
+fc_ts <- ts(InvBoxCox(fc_all$mean, lambda),
+            start     = start(test),
+            frequency = frequency(test))
+
+autoplot(impch_ts) +
+  autolayer(fc_ts, series = "ARIMA forecast") +
+  ggtitle("IMPCH: auto.arima forecast vs full series") +
+  labs(x = "Time", y = "IMPCH")
+```
+
+## Model 2: ETS (Exponential Smoothing)
+
+### Model Fitting
+
+```{r ets_fit}
+# Fit on original-scale training data
+train_orig <- window(impch_ts, end = c(2020, 12))
+
+# Auto-select best ETS model
+fit_ets_auto <- ets(train_orig)
+cat("Auto-selected ETS model:\n")
+summary(fit_ets_auto)
+```
+
+```{r ets_candidates}
+# Manual candidates for comparison
+fit_ets_MAM <- ets(train_orig, model = "MAM")  # Multiplicative errors, Additive trend, Multiplicative season
+fit_ets_MMM <- ets(train_orig, model = "MMM")  # Fully multiplicative
+fit_ets_MAMd <- ets(train_orig, model = "MAM", damped = TRUE)  # Damped trend
+
+ets_compare <- data.frame(
+  Model = c(paste0("Auto: ", fit_ets_auto$method),
+            "ETS(M,A,M)",
+            "ETS(M,M,M)",
+            "ETS(M,Ad,M)"),
+  AICc = round(c(fit_ets_auto$aicc,
+                  fit_ets_MAM$aicc,
+                  fit_ets_MMM$aicc,
+                  fit_ets_MAMd$aicc), 2),
+  BIC = round(c(fit_ets_auto$bic,
+                 fit_ets_MAM$bic,
+                 fit_ets_MMM$bic,
+                 fit_ets_MAMd$bic), 2)
+)
+ets_compare
+```
+```{r ets_select}
+# Select best based on AICc
+all_ets <- list(fit_ets_auto, fit_ets_MAM, fit_ets_MMM, fit_ets_MAMd)
+best_idx <- which.min(sapply(all_ets, function(m) m$aicc))
+best_ets <- all_ets[[best_idx]]
+
+cat("\nBest ETS model:", best_ets$method, "\n")
+cat("Smoothing parameters:\n")
+print(best_ets$par[1:min(5, length(best_ets$par))])
+```
+
+### ETS Diagnostics
+
+```{r ets_diagnostics, fig.height=7}
+checkresiduals(best_ets)
+```
+
+```{r ets_diagnostics2}
+resid_ets <- residuals(best_ets)
+shapiro_n <- min(length(resid_ets), 5000)
+shapiro.test(resid_ets[1:shapiro_n])
+
+Box.test(resid_ets, lag = 24, type = "Ljung-Box")
+```
+
+### ETS Forecast
+
+```{r ets_forecast, fig.height=5}
+fc_ets <- forecast(best_ets, h = h)
+
+autoplot(fc_ets) +
+  autolayer(test, series = "Actual", color = "red") +
+  ggtitle(paste0("Model 2: ", best_ets$method, " Forecast vs Actual")) +
+  ylab("Millions of USD") + xlab("Year") +
+  theme_minimal() +
+  guides(colour = guide_legend(title = ""))
+```
+
+### ETS Component Decomposition
+
+```{r ets_decomp, fig.height=7}
+autoplot(best_ets) +
+  ggtitle(paste0("ETS Decomposition: ", best_ets$method)) +
+  theme_minimal()
+```
+
+## Model 3 (Sine / Cosine)
+
+```{r fourier, echo=TRUE}
+# start with spectral analysis
+library(TSA)
+library
+df_periodogram <- periodogram(diff1)
+dd <- data.frame(freq = df_periodogram$freq, spec = df_periodogram$spec)
+periodogram_sorted <- dd[order(-dd$spec), ]
+head(periodogram_sorted)
+```
+We see that the highest frequencies are .083 (represents annual seasonality), (perhaps quarterly, since its roughly every 3 months), .25 (every four months)
+
+
+# Conclusion and Future Work
+
+## Summary of Results
+
+
+## Key Takeaways
+
+## Limitations
+
+## Future Work
+
+```{r model_expand_slide}
